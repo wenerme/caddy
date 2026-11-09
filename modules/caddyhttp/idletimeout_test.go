@@ -189,6 +189,39 @@ func TestIdleTimeoutReaderTerminalError(t *testing.T) {
 	}
 }
 
+func TestIdleTimeoutReaderMarksConnectionForClose(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		closeConnection bool
+		err             error
+		wantClose       bool
+	}{
+		{name: "HTTP/1 timeout", closeConnection: true, err: os.ErrDeadlineExceeded, wantClose: true},
+		{name: "HTTP/2 timeout", closeConnection: false, err: os.ErrDeadlineExceeded},
+		{name: "HTTP/1 EOF", closeConnection: true, err: io.EOF},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r := &IdleTimeoutReader{
+				ReadCloser:      io.NopCloser(iotest.ErrReader(tc.err)),
+				Ctrl:            http.NewResponseController(w),
+				Deadline:        IdleDeadline{Timeout: time.Second},
+				Logger:          zap.NewNop(),
+				closeConnection: tc.closeConnection,
+			}
+			_, err := r.Read(make([]byte, 1))
+			require.ErrorIs(t, err, tc.err)
+			writer := &readDeadlineWriter{ResponseWriterWrapper: ResponseWriterWrapper{ResponseWriter: w}, reader: r}
+			writer.WriteHeader(http.StatusBadRequest)
+			if tc.wantClose {
+				assert.Equal(t, "close", w.Header().Get("Connection"))
+			} else {
+				assert.Empty(t, w.Header().Get("Connection"))
+			}
+		})
+	}
+}
+
 // Only an expired deadline successfully installed for a draining request may
 // survive a timeout; a failed replacement must not change that decision.
 func TestIdleTimeoutReaderTimeoutDeadlineCleanup(t *testing.T) {

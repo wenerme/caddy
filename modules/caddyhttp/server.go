@@ -654,6 +654,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 			Logger:            s.logger,
 			DrainDeadline:     r.ProtoMajor == 1 && r.ContentLength != 0,
+			closeConnection:   r.ProtoMajor == 1,
 			ClearBetweenReads: r.ProtoMajor == 2,
 		}
 		defer idleReader.HandlerDone()

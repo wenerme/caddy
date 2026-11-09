@@ -1827,6 +1827,60 @@ func TestServerLogLevel(t *testing.T) {
 	}
 }
 
+// TestServer_TimedOutRequestBodyClosesHTTP1Connection verifies that a handler
+// which reads a request body past its idle deadline cannot leave the HTTP/1
+// connection reusable with a canceled request context.
+func TestServer_TimedOutRequestBodyClosesHTTP1Connection(t *testing.T) {
+	const idle = 100 * time.Millisecond
+
+	server := &Server{
+		ReadIdleTimeout: caddy.Duration(idle),
+		logger:          zap.NewNop(),
+		errorLogger:     zap.NewNop(),
+		primaryHandlerChain: HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			if r.Method == http.MethodPost {
+				if _, err := io.Copy(io.Discard, r.Body); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return nil
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			return nil
+		}),
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+
+	conn, err := net.DialTimeout("tcp", ts.Listener.Addr().String(), time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: %s\r\nContent-Length: 2\r\n\r\nx", ts.Listener.Addr())
+	require.NoError(t, err)
+	time.Sleep(2 * idle)
+
+	reader := bufio.NewReader(conn)
+	first, err := http.ReadResponse(reader, &http.Request{Method: http.MethodPost})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, first.StatusCode)
+	require.True(t, first.Close || strings.EqualFold(first.Header.Get("Connection"), "close"))
+	require.NoError(t, first.Body.Close())
+
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: "+ts.Listener.Addr().String()+"\r\n\r\n")
+	second, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err == nil {
+		defer second.Body.Close()
+		t.Fatalf("timed-out request connection was reused with status %d", second.StatusCode)
+	}
+
+	resp, err := http.Get(ts.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
 // TestServer_ClosedRequestBodyDoesNotDesyncHTTP1 verifies that an early
 // response after a handler closes its request body cannot leave the unread
 // body bytes to be parsed as the next request. This models a reverse proxy
